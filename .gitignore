@@ -1,0 +1,22 @@
+# Data — never commit actual data files
+data/
+*.db
+*.RRF
+*.csv
+*.tsv
+*.xml
+*.gz
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+.venv/
+
+# macOS
+.DS_Store
+
+# Notebooks checkpoints
+.ipynb_checkpoints/
