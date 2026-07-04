@@ -1,234 +1,188 @@
 """
-query_t2d.py
-
-End-to-end causal trace for Type 2 Diabetes.
-Demonstrates what the graph can answer right now after Phase 1.
-
-Run from project root:
-    python3 query_t2d.py
+query_t2d.py — End-to-end T2D causal trace after Phase 1 + resolver.
+Run: python3 query_t2d.py
 """
-
-import sys
-import json
+import sys, json
 sys.path.insert(0, ".")
-
 from core.graph_store import GraphStore
 from core.config import DB_PATH
 
 gs   = GraphStore(DB_PATH)
 conn = gs.conn
-
 SEP  = "─" * 55
 
 def section(title):
-    print(f"\n{SEP}")
-    print(f"  {title}")
-    print(SEP)
+    print(f"\n{SEP}\n  {title}\n{SEP}")
 
 # ── 1. Disease node ────────────────────────────────────────
 section("1. DISEASE NODE — Type 2 Diabetes")
+t2d = gs.find_by_icd10("E11.9")[0]
+print(f"  Label      : {t2d['label']}")
+print(f"  Primary ID : {t2d['primary_id']} ({t2d['primary_system']})")
+print(f"  UMLS CUI   : {t2d['xrefs'].get('UMLS_CUI','n/a')}")
+print(f"  SNOMED     : {t2d['xrefs'].get('SNOMED','n/a')}")
+print(f"  HCC code   : {t2d['hcc_code']}  <- insurance risk adjustment")
+print(f"  ICD-11     : {t2d['icd11_code']}  <- forward compatibility")
 
-t2d = gs.find_by_icd10("E11.9")
-if t2d:
-    n = t2d[0]
-    print(f"  Label      : {n['label']}")
-    print(f"  Primary ID : {n['primary_id']} ({n['primary_system']})")
-    print(f"  UMLS CUI   : {n['xrefs'].get('UMLS_CUI','n/a')}")
-    print(f"  SNOMED     : {n['xrefs'].get('SNOMED','n/a')}")
-    print(f"  HCC code   : {n['hcc_code']}  <- insurance risk adjustment")
-    print(f"  ICD-11     : {n['icd11_code']}  <- forward compatibility")
-    print(f"  Confidence : {n['confidence']}")
+# ── 2. Causal variants — correct target IDs after resolver ─
+section("2. CAUSAL VARIANTS → T2D CONCEPTS (conf ≥ 0.70)")
 
-# ── 2. What causes T2D — CAUSES edges INTO the disease ────
-section("2. CAUSAL VARIANTS → T2D  (CAUSES edges, conf ≥ 0.70)")
+rows = conn.execute("""
+    SELECT e.source_id,
+           json_extract(n_src.properties,'$.gene_symbol') as gene,
+           e.relationship_type, e.confidence,
+           n_tgt.label as disease, n_tgt.primary_system
+    FROM edges e
+    JOIN nodes n_src ON n_src.primary_id = e.source_id
+    JOIN nodes n_tgt ON n_tgt.primary_id   = e.target_id
+                     AND n_tgt.primary_system = e.target_system
+    WHERE n_src.entity_type = 'Variant'
+      AND n_tgt.label LIKE '%iabetes%'
+      AND e.relationship_type IN ('CAUSES','CONTRIBUTES_TO','INCREASES_RISK_OF')
+      AND e.confidence >= 0.70
+    ORDER BY e.confidence DESC, e.relationship_type
+    LIMIT 15
+""").fetchall()
 
-# T2D is stored under ICD-10 primary, but ClinVar edges point
-# to SNOMED or UMLS_CUI — query both
-t2d_snomed = "44054006"
-t2d_cui    = "C0011860"
+print(f"  Found {len(rows)} high-confidence causal edges (showing 15)")
+for r in rows:
+    print(f"\n  [{r[2]}] conf={r[3]} gene={r[1]}")
+    print(f"    Variant : {r[0]}")
+    print(f"    Disease : {r[4][:55]} ({r[5]})")
 
-causes_snomed = conn.execute("""
-    SELECT source_id, source_system, relationship_type,
-           confidence, study_design, source_relationship_type
-    FROM edges
-    WHERE target_id = ?
-      AND relationship_type IN ('CAUSES','CONTRIBUTES_TO','INCREASES_RISK_OF')
-      AND confidence >= 0.70
-    ORDER BY confidence DESC
-    LIMIT 10
-""", (t2d_snomed,)).fetchall()
+# ── 3. All diabetes concepts with causal edges ─────────────
+section("3. DIABETES CONCEPT MAP — all subtypes in graph")
 
-causes_cui = conn.execute("""
-    SELECT source_id, source_system, relationship_type,
-           confidence, study_design, source_relationship_type
-    FROM edges
-    WHERE target_id = ?
-      AND relationship_type IN ('CAUSES','CONTRIBUTES_TO','INCREASES_RISK_OF')
-      AND confidence >= 0.70
-    ORDER BY confidence DESC
-    LIMIT 10
-""", (t2d_cui,)).fetchall()
+concepts = conn.execute("""
+    SELECT n.primary_id, n.primary_system, n.label,
+           COUNT(DISTINCT e.source_id) as n_variants,
+           SUM(CASE WHEN e.relationship_type='CAUSES' THEN 1 ELSE 0 END) as causes,
+           SUM(CASE WHEN e.relationship_type='CONTRIBUTES_TO' THEN 1 ELSE 0 END) as contrib
+    FROM nodes n
+    JOIN edges e ON e.target_id = n.primary_id
+                 AND e.target_system = n.primary_system
+    WHERE n.label LIKE '%iabetes%'
+      AND e.relationship_type IN ('CAUSES','CONTRIBUTES_TO','INCREASES_RISK_OF')
+    GROUP BY n.primary_id, n.primary_system
+    ORDER BY n_variants DESC
+    LIMIT 12
+""").fetchall()
 
-all_causes = causes_snomed + causes_cui
-print(f"  Found {len(all_causes)} high-confidence causal edges (showing top 10)")
-for row in all_causes[:10]:
-    src_id, src_sys, rel, conf, study, raw = row
-    # Look up variant label
-    node = gs.get_node(src_id, src_sys)
-    label = node['label'][:50] if node else src_id
-    props = node['properties'] if node else {}
-    gene  = props.get('gene_symbol', '?') if isinstance(props, dict) else '?'
-    print(f"\n  [{rel}] conf={conf} study={study}")
-    print(f"    Variant : {src_id} ({src_sys})")
-    print(f"    Gene    : {gene}")
-    print(f"    Label   : {label}")
-    print(f"    ClinSig : {raw}")
+print(f"  {'Label':<50} {'System':<12} {'Variants':>8} {'CAUSES':>7} {'CONTRIB':>7}")
+print(f"  {'-'*50} {'-'*12} {'-'*8} {'-'*7} {'-'*7}")
+for r in concepts:
+    print(f"  {r[2][:50]:<50} {r[1]:<12} {r[3]:>8,} {r[4]:>7,} {r[5]:>7,}")
 
-# ── 3. TCF7L2 full picture ─────────────────────────────────
-section("3. TCF7L2 GENE — full picture in the graph")
+# ── 4. BRCA1 → Breast Cancer ───────────────────────────────
+section("4. BRCA1 VARIANTS → Breast Cancer (after resolver)")
 
-tcf7l2_variants = conn.execute("""
-    SELECT primary_id, primary_system, confidence,
-           json_extract(properties,'$.clinsig') as clinsig,
-           json_extract(properties,'$.review_status') as review
-    FROM nodes
-    WHERE entity_type = 'Variant'
-      AND json_extract(properties,'$.gene_symbol') = 'TCF7L2'
-    ORDER BY confidence DESC
+brca1 = conn.execute("""
+    SELECT e.source_id, e.relationship_type, e.confidence,
+           n_tgt.label, n_tgt.primary_system
+    FROM edges e
+    JOIN nodes n_src ON n_src.primary_id = e.source_id
+    JOIN nodes n_tgt ON n_tgt.primary_id   = e.target_id
+                     AND n_tgt.primary_system = e.target_system
+    WHERE json_extract(n_src.properties,'$.gene_symbol') = 'BRCA1'
+      AND e.relationship_type = 'CAUSES'
+      AND e.confidence >= 0.85
+    ORDER BY e.confidence DESC
     LIMIT 8
 """).fetchall()
 
-print(f"  TCF7L2 variants in graph: "
-      f"{conn.execute('SELECT COUNT(*) FROM nodes WHERE entity_type=? AND json_extract(properties,?) = ?', ('Variant','$.gene_symbol','TCF7L2')).fetchone()[0]:,}")
-print(f"  Top variants by confidence:")
-for v in tcf7l2_variants:
-    print(f"    {v[0]:15s} conf={v[2]:.2f}  clinsig={v[3]}  review={v[4]}")
-
-# ── 4. BRCA1 — breast cancer causal chain ─────────────────
-section("4. BRCA1 VARIANTS → Breast Cancer")
-
-brca1_count = conn.execute("""
-    SELECT COUNT(*) FROM nodes
-    WHERE entity_type='Variant'
-    AND json_extract(properties,'$.gene_symbol')='BRCA1'
+total_brca1 = conn.execute("""
+    SELECT COUNT(*) FROM edges e
+    JOIN nodes n ON n.primary_id = e.source_id
+    WHERE json_extract(n.properties,'$.gene_symbol') = 'BRCA1'
+      AND e.relationship_type = 'CAUSES'
 """).fetchone()[0]
 
-brca1_causes = conn.execute("""
-    SELECT e.source_id, e.relationship_type, e.confidence,
-           n.label as target_label
-    FROM edges e
-    JOIN nodes n ON n.primary_id = e.target_id
-    WHERE e.source_id IN (
-        SELECT primary_id FROM nodes
-        WHERE entity_type='Variant'
-        AND json_extract(properties,'$.gene_symbol')='BRCA1'
-        AND confidence >= 0.85
-    )
-    AND e.relationship_type = 'CAUSES'
-    ORDER BY e.confidence DESC
-    LIMIT 5
-""").fetchall()
+print(f"  Total BRCA1 CAUSES edges : {total_brca1:,}")
+print(f"  Expert-panel reviewed (conf≥0.85):")
+for r in brca1:
+    print(f"    {r[0]} --[{r[1]}]--> {r[3][:45]} ({r[4]}) conf={r[2]}")
 
-print(f"  BRCA1 variants in graph : {brca1_count:,}")
-print(f"  High-confidence CAUSES edges (expert-panel reviewed):")
-for row in brca1_causes:
-    print(f"    {row[0]} --[{row[1]}]--> {row[3][:45]}  conf={row[2]}")
+# ── 5. GLP-1 pathway → Drug connection ────────────────────
+section("5. GLP-1 PATHWAY → DRUG TARGET CONNECTION")
 
-# ── 5. Drug → T2D treatment edges ─────────────────────────
-section("5. DRUGS THAT TREAT T2D")
+glp1_pathway = conn.execute("""
+    SELECT primary_id, label FROM nodes
+    WHERE primary_id = 'R-HSA-381676'
+""").fetchone()
 
-drugs = conn.execute("""
-    SELECT e.source_id, e.source_system, e.confidence,
-           n.label, n.rxnorm_cui
-    FROM edges e
-    JOIN nodes n ON n.primary_id = e.source_id
-                 AND n.primary_system = e.source_system
-    WHERE e.target_id IN (?, ?)
-      AND e.relationship_type = 'TREATS'
-    ORDER BY e.confidence DESC
-    LIMIT 10
-""", (t2d_snomed, "E11.9")).fetchall()
+if glp1_pathway:
+    print(f"  Pathway: {glp1_pathway[1]}")
+    members = conn.execute("""
+        SELECT e.source_id, e.source_system, e.confidence
+        FROM edges e
+        WHERE e.target_id = 'R-HSA-381676'
+          AND e.relationship_type = 'PART_OF'
+        LIMIT 10
+    """).fetchall()
+    print(f"  Proteins in this pathway: {len(members)}")
+    for m in members[:5]:
+        print(f"    {m[0]} ({m[1]}) conf={m[2]}")
 
-print(f"  Found {len(drugs)} drugs with TREATS → T2D edges")
-for d in drugs[:8]:
-    print(f"  [{d[1]}] {d[3][:50]}")
-    print(f"    RxNorm={d[4]}  confidence={d[2]}")
+# ── 6. Insulin-related pathways ────────────────────────────
+section("6. INSULIN/GLUCOSE PATHWAYS IN REACTOME")
 
-# ── 6. Pathways connected to T2D ──────────────────────────
-section("6. PATHWAYS RELEVANT TO T2D")
-
-# Find proteins associated with T2D-related genes,
-# then look up which pathways they belong to
-t2d_pathways = conn.execute("""
-    SELECT DISTINCT n.primary_id, n.label, n.tier
-    FROM nodes n
-    JOIN edges e ON e.target_id = n.primary_id
-    WHERE n.entity_type = 'Pathway'
-      AND e.source_id IN (
-          SELECT primary_id FROM nodes
-          WHERE entity_type='Variant'
-          AND json_extract(properties,'$.gene_symbol')
-              IN ('TCF7L2','PPARG','KCNJ11','ABCC8','SLC30A8','HNF1A')
-      )
-    LIMIT 10
-""").fetchall()
-
-# Alternative: search pathway labels directly
-insulin_pathways = conn.execute("""
-    SELECT primary_id, label
-    FROM nodes
+pathways = conn.execute("""
+    SELECT primary_id, label FROM nodes
     WHERE entity_type = 'Pathway'
       AND (label LIKE '%nsulin%'
         OR label LIKE '%lucose%'
         OR label LIKE '%lycoly%'
         OR label LIKE '%eta cell%'
-        OR label LIKE '%ancrea%')
+        OR label LIKE '%GLP%')
     ORDER BY label
     LIMIT 12
 """).fetchall()
 
-print(f"  Insulin/glucose/beta-cell pathways in Reactome:")
-for p in insulin_pathways:
-    print(f"    {p[0]}  {p[1]}")
+for p in pathways:
+    n_members = conn.execute(
+        "SELECT COUNT(*) FROM edges WHERE target_id=? AND relationship_type='PART_OF'",
+        (p[0],)
+    ).fetchone()[0]
+    print(f"  {p[0]}  {p[1][:50]:<50}  ({n_members} members)")
 
-# ── 7. Causal chain summary ────────────────────────────────
-section("7. CAUSAL CHAIN SUMMARY — what the graph knows about T2D")
+# ── 7. Full causal summary ─────────────────────────────────
+section("7. CAUSAL CHAIN — all edge types into diabetes concepts")
 
-total_t2d_edges = conn.execute("""
-    SELECT relationship_type, COUNT(*) as n
-    FROM edges
-    WHERE target_id IN (?, ?, 'E11.9')
-    GROUP BY relationship_type
+all_edges = conn.execute("""
+    SELECT e.relationship_type, COUNT(*) as n
+    FROM edges e
+    JOIN nodes n ON n.primary_id   = e.target_id
+                 AND n.primary_system = e.target_system
+    WHERE n.label LIKE '%iabetes%'
+    GROUP BY e.relationship_type
     ORDER BY n DESC
-""", (t2d_snomed, t2d_cui)).fetchall()
+""").fetchall()
 
-print("  All edge types pointing TO T2D concepts:")
-for rel, count in total_t2d_edges:
-    print(f"    {rel:30s} : {count:,}")
+for rel, n in all_edges:
+    print(f"  {rel:30s}: {n:,}")
 
-# ── 8. Graph health check ──────────────────────────────────
-section("8. GRAPH HEALTH CHECK")
+# ── 8. Graph health ────────────────────────────────────────
+section("8. GRAPH HEALTH")
 
 stats = gs.stats()
-print(f"  Total nodes      : {stats['total_nodes']:,}")
-print(f"  Total edges      : {stats['total_edges']:,}")
-print(f"  Nodes by tier    :")
 tier_names = {
     1:"Molecular", 2:"Networks", 3:"Cellular",
     4:"Tissue/Organ", 5:"Systemic", 6:"Phenotype",
     7:"Disease", 8:"Behavior", 9:"Social",
     10:"Healthcare", 11:"Population"
 }
+print(f"  Total nodes: {stats['total_nodes']:,}  "
+      f"Total edges: {stats['total_edges']:,}")
+print(f"\n  Nodes by tier:")
 for tier, count in sorted(stats['nodes_by_tier'].items()):
-    name = tier_names.get(tier, "Unknown")
-    bar  = "█" * min(count // 10000, 40)
+    bar  = "█" * min(count // 10000, 35)
+    name = tier_names.get(tier,"?")
     print(f"    Tier {tier:2d} {name:12s}: {count:>9,}  {bar}")
 
-print(f"\n  Causal edge quality breakdown:")
-causal_rels = ['CAUSES','CONTRIBUTES_TO','INCREASES_RISK_OF',
-               'PROTECTS_AGAINST','ASSOCIATED_WITH']
-for rel in causal_rels:
-    count = stats['edges_by_relationship'].get(rel, 0)
-    print(f"    {rel:30s}: {count:,}")
+print(f"\n  Causal edge quality:")
+for rel in ['CAUSES','CONTRIBUTES_TO','INCREASES_RISK_OF',
+            'PROTECTS_AGAINST','ASSOCIATED_WITH']:
+    n = stats['edges_by_relationship'].get(rel, 0)
+    print(f"    {rel:30s}: {n:,}")
 
-print(f"\n✓  Phase 1 query complete")
+print(f"\n✓  Phase 1 complete — ready for Phase 2")
