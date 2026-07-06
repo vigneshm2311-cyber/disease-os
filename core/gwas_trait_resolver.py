@@ -143,9 +143,10 @@ def resolve_all(conn) -> dict:
     """
     # Get all distinct unresolved GWAS trait labels
     traits = conn.execute("""
-        SELECT DISTINCT target_id, COUNT(*) as n
+        SELECT target_id, COUNT(*) as n
         FROM edges
         WHERE target_system = 'GWAS_trait_label'
+        GROUP BY target_id
         ORDER BY n DESC
     """).fetchall()
 
