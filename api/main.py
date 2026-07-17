@@ -162,7 +162,10 @@ def get_drugs(icd10: str, top_n: int = Query(20, ge=1, le=100)):
         JOIN nodes n ON n.primary_id=e.source_id AND n.primary_system=e.source_system
         WHERE e.target_id=? AND e.target_system=?
           AND n.entity_type IN ("Drug_clinical","Pharmacologic Substance")
-        ORDER BY e.confidence DESC LIMIT ?
+        ORDER BY
+            CASE e.relationship_type WHEN "TREATS" THEN 0 ELSE 1 END,
+            e.confidence DESC
+        LIMIT ?
     """, (node["primary_id"], node["primary_system"], top_n)).fetchall()
     return {"disease": node["label"], "icd10": icd10, "count": len(rows),
             "drugs": [{"primary_id":r[0],"label":r[1],"rxnorm_cui":r[2],
