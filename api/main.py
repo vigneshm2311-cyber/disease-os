@@ -73,7 +73,8 @@ PUBLIC_PATHS = {"/health", "/docs", "/redoc", "/openapi.json"}
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    if request.url.path in PUBLIC_PATHS:
+    # Allow CORS preflight and public paths without auth
+    if request.method == "OPTIONS" or request.url.path in PUBLIC_PATHS:
         return await call_next(request)
     key = request.headers.get("X-API-Key","")
     if key != API_KEY:
@@ -108,12 +109,11 @@ _cache: dict = {}   # simple TTL cache
 CACHE_TTL = 3600    # 1 hour
 
 def get_conn() -> sqlite3.Connection:
-    global _conn
-    if _conn is None:
-        _conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-        _conn.execute("PRAGMA cache_size=-256000;")
-        _conn.execute("PRAGMA temp_store=MEMORY;")
-    return _conn
+    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    conn.execute("PRAGMA cache_size=-65536;")
+    conn.execute("PRAGMA temp_store=MEMORY;")
+    conn.execute("PRAGMA journal_mode=WAL;")
+    return conn
 
 def get_engine() -> CausalEngine:
     global _engine
